@@ -8,10 +8,18 @@ const JUMP = -13;
 const TILE_SIZE = 60; // size of one tile on screen, in pixels (32 x 16 tiles = 1920 x 960)
 let SCALE = 3;        // set automatically for each level
 
+// --- Wall slide and wall jump settings ---
+const WALL_SLIDE_SPEED = 2;  // fastest fall speed while sliding on a wall (0 = stick completely)
+const WALL_JUMP_X = 7;       // sideways push away from the wall
+const WALL_JUMP_Y = -12;     // upward push
+const WALL_JUMP_LOCK = 10;   // frames you can't steer after a wall jump, so you actually leave the wall
+
 // --- Files (edit this list to match the levels you have) ---
 const ASSET_FOLDER = "assets/"; // all tileset pictures go in this folder
 const LEVEL_FILES = [
   "levels/level1.json",
+  "levels/level2.json",
+  "levels/level3.json",
 ];
 
 // --- Loaded data ---
@@ -30,6 +38,24 @@ let score = 0;
 let gameWon = false;
 let gameState = "loading"; // "loading", "start", "playing", "error"
 let errorMessage = "";
+
+// --- Wall state ---
+let wallDir = 0;        // -1 = wall on the left, 1 = wall on the right, 0 = no wall touching
+let wallSliding = false;
+let wallJumpTimer = 0;
+let wallJumpVx = 0;
+let jumpWasDown = false; // used to tell a fresh jump press from a held key
+
+// --- Player animation ---
+// Each number is an offset from the character tile you placed in Tiled:
+// 0 = that same tile, 1 = the next tile to the right, 2 = two tiles right, ...
+const IDLE_FRAMES = [0];
+const WALK_FRAMES = [0, 1];
+const JUMP_FRAMES = [1];
+const WALL_FRAMES = [1]; // picture used while sliding on a wall
+const FRAME_TIME = 8; // game frames per picture (bigger = slower)
+const SPRITE_FACES = -1; // -1 = the picture faces left, 1 = the picture faces right
+let animTimer = 0;
 
 const player = { x: 0, y: 0, w: 40, h: 40, vx: 0, vy: 0, onGround: false };
 
@@ -89,9 +115,13 @@ function findTileset(gid) {
   return null;
 }
 
-// --- Draw one tile from its tileset picture ---
+// --- Draw one tile from its tileset picture (handles Tiled's flips and rotations) ---
 function drawTile(rawGid, dx, dy, dw, dh) {
-  const gid = rawGid & 0x0fffffff; // ignores flip flags
+  const gid = rawGid & 0x0fffffff;
+  const flipH = (rawGid & 0x80000000) !== 0;
+  const flipV = (rawGid & 0x40000000) !== 0;
+  const flipD = (rawGid & 0x20000000) !== 0; // diagonal flip (used when rotating painted tiles)
+
   const ts = findTileset(gid);
   if (!ts) return;
 
@@ -102,8 +132,21 @@ function drawTile(rawGid, dx, dy, dw, dh) {
   const spacing = ts.spacing || 0;
   const sx = margin + col * (ts.tilewidth + spacing);
   const sy = margin + row * (ts.tileheight + spacing);
+  const img = images[ts.file];
 
-  ctx.drawImage(images[ts.file], sx, sy, ts.tilewidth, ts.tileheight, dx, dy, dw, dh);
+  if (!flipH && !flipV && !flipD) {
+    ctx.drawImage(img, sx, sy, ts.tilewidth, ts.tileheight, dx, dy, dw, dh);
+    return;
+  }
+
+  // Flipped or rotated: draw around the tile's center
+  ctx.save();
+  ctx.translate(dx + dw / 2, dy + dh / 2);
+  if (flipV) ctx.scale(1, -1);
+  if (flipH) ctx.scale(-1, 1);
+  if (flipD) ctx.transform(0, 1, 1, 0, 0, 0);
+  ctx.drawImage(img, sx, sy, ts.tilewidth, ts.tileheight, -dw / 2, -dh / 2, dw, dh);
+  ctx.restore();
 }
 
 // --- Draw a tile in a map square (bigger tiles stick out up and to the right, like in Tiled) ---
@@ -116,18 +159,56 @@ function drawTileInCell(gid, col, row) {
 }
 
 // --- Turn a Tiled object into something the game can use ---
-function makeEntity(o, shrink) {
+// Tile objects are positioned and rotated around their bottom-left corner, like in Tiled.
+function makeEntity(o, shrink, isSpike) {
   const dw = o.width * SCALE;
   const dh = o.height * SCALE;
-  const dx = o.x * SCALE;
-  const dy = (o.gid ? o.y - o.height : o.y) * SCALE; // tile objects are positioned from their bottom-left
+  const ox = o.x * SCALE;
+  const oy = o.y * SCALE;
+  const rot = o.rotation || 0;
+  const top = o.gid ? -dh : 0; // tile objects sit above their origin
+  const flipV = o.gid ? (o.gid & 0x40000000) !== 0 : false;
+
+  // Hitbox before rotating (measured from the object's origin)
+  let lx = dw * shrink;
+  let ly = top + dh * shrink;
+  let lw = dw * (1 - 2 * shrink);
+  let lh = dh * (1 - 2 * shrink);
+
+  if (isSpike) {
+    // Only the pointy half hurts: the lower 55% (or the upper part if flipped upside down)
+    lx = dw * 0.2;
+    lw = dw * 0.6;
+    lh = dh * 0.55;
+    ly = flipV ? top : top + dh * 0.45;
+  }
+
+  // Rotate the hitbox corners, then use the box that surrounds them
+  const a = (rot * Math.PI) / 180;
+  const cos = Math.cos(a);
+  const sin = Math.sin(a);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const corners = [
+    [lx, ly],
+    [lx + lw, ly],
+    [lx, ly + lh],
+    [lx + lw, ly + lh],
+  ];
+  for (const [cx, cy] of corners) {
+    const wx = ox + cx * cos - cy * sin;
+    const wy = oy + cx * sin + cy * cos;
+    minX = Math.min(minX, wx);
+    minY = Math.min(minY, wy);
+    maxX = Math.max(maxX, wx);
+    maxY = Math.max(maxY, wy);
+  }
+
   return {
     gid: o.gid,
-    dx, dy, dw, dh,                 // where to draw it
-    x: dx + dw * shrink,            // hitbox (slightly smaller than the picture)
-    y: dy + dh * shrink,
-    w: dw * (1 - 2 * shrink),
-    h: dh * (1 - 2 * shrink),
+    ox, oy, rot, dw, dh,            // where and how to draw it
+    dx: ox, dy: oy + top,           // top-left corner when not rotated
+    x: minX, y: minY,               // hitbox
+    w: maxX - minX, h: maxY - minY,
     collected: false,
   };
 }
@@ -180,10 +261,7 @@ function loadLevel(n) {
         } else if (name === "coin") {
           coins.push(makeEntity(o, 0.2));
         } else if (name === "spike") {
-          const s = makeEntity(o, 0.2);
-          s.y = s.dy + s.dh * 0.45; // hitbox sits in the lower part of the spike
-          s.h = s.dh * 0.55;
-          spikes.push(s);
+          spikes.push(makeEntity(o, 0, true));
         } else if (name === "goal") {
           goal = makeEntity(o, 0.1);
         }
@@ -198,6 +276,9 @@ function resetPlayer() {
   player.y = startPos.y;
   player.vx = 0;
   player.vy = 0;
+  wallDir = 0;
+  wallSliding = false;
+  wallJumpTimer = 0;
 }
 
 function restartGame() {
@@ -233,27 +314,68 @@ function isColliding(a, b) {
   );
 }
 
+// --- Is there a wall touching the player's left or right side? ---
+function checkWall() {
+  const leftProbe = { x: player.x - 2, y: player.y + 6, w: 2, h: player.h - 12 };
+  const rightProbe = { x: player.x + player.w, y: player.y + 6, w: 2, h: player.h - 12 };
+
+  for (const p of platforms) {
+    if (isColliding(leftProbe, p)) return -1;
+    if (isColliding(rightProbe, p)) return 1;
+  }
+  return 0;
+}
+
 function update() {
   if (gameState !== "playing" || gameWon) return;
 
-  // Left and right
+  // Which wall (if any) are we touching? Checked before moving.
+  wallDir = checkWall();
+
+  // Left and right (steering is locked for a moment after a wall jump)
   player.vx = 0;
-  if (keys["ArrowLeft"]) {
-    player.vx = -SPEED;
-    facing = -1;
-  }
-  if (keys["ArrowRight"]) {
-    player.vx = SPEED;
-    facing = 1;
+  if (wallJumpTimer > 0) {
+    wallJumpTimer--;
+    player.vx = wallJumpVx;
+  } else {
+    if (keys["ArrowLeft"]) {
+      player.vx = -SPEED;
+      facing = -1;
+    }
+    if (keys["ArrowRight"]) {
+      player.vx = SPEED;
+      facing = 1;
+    }
   }
 
-  // Jump
-  if ((keys["ArrowUp"] || keys[" "]) && player.onGround) {
+  // Animation timer: runs while moving, resets when standing still
+  if (player.vx !== 0) animTimer++;
+  else animTimer = 0;
+
+  // Jump: normal jump on the ground, wall jump in the air next to a wall
+  const jumpDown = keys["ArrowUp"] || keys[" "];
+  const jumpPressed = jumpDown && !jumpWasDown; // true only on the frame the key goes down
+  jumpWasDown = jumpDown;
+
+  if (jumpDown && player.onGround) {
     player.vy = JUMP;
     player.onGround = false;
+  } else if (jumpPressed && !player.onGround && wallDir !== 0) {
+    player.vy = WALL_JUMP_Y;
+    wallJumpVx = -wallDir * WALL_JUMP_X; // push away from the wall
+    wallJumpTimer = WALL_JUMP_LOCK;
+    facing = -wallDir;
   }
 
   player.vy += GRAVITY;
+
+  // Wall slide: in the air, touching a wall, pushing toward it, and falling
+  const pushingIntoWall =
+    (wallDir === -1 && keys["ArrowLeft"]) || (wallDir === 1 && keys["ArrowRight"]);
+  wallSliding = !player.onGround && wallDir !== 0 && pushingIntoWall && player.vy > 0;
+  if (wallSliding) {
+    player.vy = Math.min(player.vy, WALL_SLIDE_SPEED);
+  }
 
   // Horizontal movement + collisions
   player.x += player.vx;
@@ -310,14 +432,21 @@ function update() {
   }
 }
 
-// Draw a coin / spike / goal: its tile picture if it has one, otherwise a colored box
+// Draw a coin / spike / goal: its tile picture if it has one, otherwise a colored box.
+// Rotation happens around the object's origin, just like in Tiled.
 function drawEntity(e, fallbackColor) {
+  ctx.save();
+  ctx.translate(e.ox, e.oy);
+  ctx.rotate((e.rot * Math.PI) / 180);
+
   if (e.gid) {
-    drawTile(e.gid, e.dx, e.dy, e.dw, e.dh);
+    drawTile(e.gid, 0, -e.dh, e.dw, e.dh); // tile objects sit above their bottom-left origin
   } else {
     ctx.fillStyle = fallbackColor;
-    ctx.fillRect(e.dx, e.dy, e.dw, e.dh);
+    ctx.fillRect(0, 0, e.dw, e.dh);
   }
+
+  ctx.restore();
 }
 
 function drawPlayer() {
@@ -329,6 +458,15 @@ function drawPlayer() {
     return;
   }
 
+  // Pick the pictures that match what the player is doing
+  let frames = IDLE_FRAMES;
+  if (wallSliding) frames = WALL_FRAMES;
+  else if (!player.onGround) frames = JUMP_FRAMES;
+  else if (player.vx !== 0) frames = WALK_FRAMES;
+
+  const frame = frames[Math.floor(animTimer / FRAME_TIME) % frames.length];
+  const gid = (playerGid & 0x0fffffff) + frame;
+
   // The picture keeps its natural size, centered on the hitbox with feet at the bottom
   const sw = ts.tilewidth * SCALE;
   const sh = ts.tileheight * SCALE;
@@ -337,12 +475,12 @@ function drawPlayer() {
   const sy = player.y + player.h - sh;
 
   ctx.save();
-  if (facing === -1) {
+  if (facing !== SPRITE_FACES) {
     ctx.translate(cx, 0);
     ctx.scale(-1, 1);
     ctx.translate(-cx, 0);
   }
-  drawTile(playerGid, sx, sy, sw, sh);
+  drawTile(gid, sx, sy, sw, sh);
   ctx.restore();
 }
 
@@ -385,11 +523,12 @@ function draw() {
 
     ctx.font = "32px Arial";
     ctx.fillText("Collect coins, avoid spikes, reach the goal!", canvas.width / 2, canvas.height / 2 - 30);
-    ctx.fillText("Arrow keys: move    Up / Space: jump    R: restart", canvas.width / 2, canvas.height / 2 + 20);
+    ctx.fillText("Arrow keys: move    Up / Space: jump    Hold toward a wall to slide, jump to wall jump", canvas.width / 2, canvas.height / 2 + 20);
+    ctx.fillText("R: restart", canvas.width / 2, canvas.height / 2 + 60);
 
     ctx.fillStyle = "gold";
     ctx.font = "44px Arial";
-    ctx.fillText("Press ENTER to start", canvas.width / 2, canvas.height / 2 + 110);
+    ctx.fillText("Press ENTER to start", canvas.width / 2, canvas.height / 2 + 140);
 
     ctx.textAlign = "left";
     return;
