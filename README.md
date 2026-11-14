@@ -6,7 +6,8 @@ This project was made as a Web Development finals project.
 
 ## Play the game
 
-Play it online here: **https://YOUR-USERNAME.github.io/YOUR-REPOSITORY/**
+[Play Nezram Platformer here:](https://marzenel.github.io/Nezram_Platformer/)
+
 
 (Replace the link above with the address of your GitHub Pages site.)
 
